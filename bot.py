@@ -1,11 +1,15 @@
 import asyncio
+import os
 from groq import Groq
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from dotenv import load_dotenv
 
-TELEGRAM_TOKEN = "8843916498:AAHavIeJORRzMSCQOoDvWXs7Ec82XU3X978"
-GROQ_API_KEY = "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"
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
