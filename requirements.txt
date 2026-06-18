@@ -1,0 +1,6 @@
+aiogram==3.29.0
+groq==1.4.0
+python-dotenv==1.2.2
+git add .
+git commit -m "add requirements"
+git push
