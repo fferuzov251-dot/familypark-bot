@@ -228,7 +228,7 @@ async def voice_message(message: types.Message):
     except Exception as e:
         await message.answer(f"Ошибка: {str(e)}", reply_markup=main_menu(lang))
         
-    @dp.message()
+    @dp.message(F.text)
     async def ai_response(message: types.Message):
      resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
      lang = get_lang(resident)
