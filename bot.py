@@ -2,7 +2,7 @@ import asyncio
 import os
 from groq import Groq
 from supabase import create_client
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
@@ -38,6 +38,7 @@ TEXTS = {
         "thinking": "⏳ Думаю...",
         "choose_lang": "Выберите язык / Tilni tanlang:",
         "lang_set": "✅ Язык изменён на русский.",
+        "voice_heard": "🎤 Вы сказали: {text}",
     },
     "uz": {
         "btn_balance": "💰 Mening balansim",
@@ -56,6 +57,7 @@ TEXTS = {
         "thinking": "⏳ O'ylayapman...",
         "choose_lang": "Tilni tanlang / Выберите язык:",
         "lang_set": "✅ Til o'zbekchaga o'zgartirildi.",
+        "voice_heard": "🎤 Siz aytdingiz: {text}",
     },
 }
 
@@ -176,10 +178,60 @@ async def info(message: types.Message):
     await message.answer(TEXTS[lang]["info"])
 
 
-@dp.message()
-async def ai_response(message: types.Message):
+@dp.message(F.voice)
+async def voice_message(message: types.Message):
     resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
     lang = get_lang(resident)
+    await message.answer(TEXTS[lang]["thinking"])
+    try:
+        # Скачиваем голосовой файл
+        file = await bot.get_file(message.voice.file_id)
+        file_path = f"/tmp/voice_{message.from_user.id}.ogg"
+        await bot.download_file(file.file_path, file_path)
+
+        # Распознаём речь через Whisper (Groq)
+        with open(file_path, "rb") as audio:
+            transcription = groq_client.audio.transcriptions.create(
+                file=(file_path, audio.read()),
+                model="whisper-large-v3",
+            )
+        text = transcription.text.strip()
+        os.remove(file_path)
+
+        if not text:
+            await message.answer("🎤 ...", reply_markup=main_menu(lang))
+            return
+
+        # Показываем распознанный текст
+        await message.answer(TEXTS[lang]["voice_heard"].format(text=text))
+
+        # Если похоже на заявку на ремонт — сохраняем
+        repair_keywords = ["сломал", "течет", "не работает", "ремонт", "сломан", "протекает",
+                           "buzildi", "ishlamayapti", "oqyapti", "ta'mir", "sindi"]
+        if any(word in text.lower() for word in repair_keywords):
+            supabase.table("requests").insert({
+                "telegram_id": message.from_user.id,
+                "description": text,
+                "status": "new"
+            }).execute()
+
+        # Отвечаем через ИИ
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": text}
+            ],
+            max_tokens=500
+        )
+        await message.answer(response.choices[0].message.content, reply_markup=main_menu(lang))
+    except Exception as e:
+        await message.answer(f"Ошибка: {str(e)}", reply_markup=main_menu(lang))
+        
+    @dp.message()
+    async def ai_response(message: types.Message):
+     resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
+     lang = get_lang(resident)
 
     repair_keywords = ["сломал", "течет", "не работает", "ремонт", "сломан", "протекает",
                        "buzildi", "ishlamayapti", "oqyapti", "ta'mir", "sindi"]
