@@ -104,9 +104,29 @@ def lang_keyboard():
     ])
 
 
-# Определяем, на какую кнопку нажали, независимо от языка
 def match_button(text, key):
     return text in (TEXTS["ru"][key], TEXTS["uz"][key])
+
+
+async def process_text(message, text, lang):
+    repair_keywords = ["сломал", "течет", "не работает", "ремонт", "сломан", "протекает",
+                       "buzildi", "ishlamayapti", "oqyapti", "ta'mir", "sindi"]
+    if any(word in text.lower() for word in repair_keywords):
+        supabase.table("requests").insert({
+            "telegram_id": message.from_user.id,
+            "description": text,
+            "status": "new"
+        }).execute()
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": text}
+        ],
+        max_tokens=500
+    )
+    await message.answer(response.choices[0].message.content, reply_markup=main_menu(lang))
 
 
 @dp.message(Command("start"))
@@ -184,12 +204,10 @@ async def voice_message(message: types.Message):
     lang = get_lang(resident)
     await message.answer(TEXTS[lang]["thinking"])
     try:
-        # Скачиваем голосовой файл
         file = await bot.get_file(message.voice.file_id)
         file_path = f"/tmp/voice_{message.from_user.id}.ogg"
         await bot.download_file(file.file_path, file_path)
 
-        # Распознаём речь через Whisper (Groq)
         with open(file_path, "rb") as audio:
             transcription = groq_client.audio.transcriptions.create(
                 file=(file_path, audio.read()),
@@ -202,57 +220,19 @@ async def voice_message(message: types.Message):
             await message.answer("🎤 ...", reply_markup=main_menu(lang))
             return
 
-        # Показываем распознанный текст
         await message.answer(TEXTS[lang]["voice_heard"].format(text=text))
-
-        # Если похоже на заявку на ремонт — сохраняем
-        repair_keywords = ["сломал", "течет", "не работает", "ремонт", "сломан", "протекает",
-                           "buzildi", "ishlamayapti", "oqyapti", "ta'mir", "sindi"]
-        if any(word in text.lower() for word in repair_keywords):
-            supabase.table("requests").insert({
-                "telegram_id": message.from_user.id,
-                "description": text,
-                "status": "new"
-            }).execute()
-
-        # Отвечаем через ИИ
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": text}
-            ],
-            max_tokens=500
-        )
-        await message.answer(response.choices[0].message.content, reply_markup=main_menu(lang))
+        await process_text(message, text, lang)
     except Exception as e:
         await message.answer(f"Ошибка: {str(e)}", reply_markup=main_menu(lang))
-        
-    @dp.message(F.text)
-    async def ai_response(message: types.Message):
-     resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
-     lang = get_lang(resident)
 
-    repair_keywords = ["сломал", "течет", "не работает", "ремонт", "сломан", "протекает",
-                       "buzildi", "ishlamayapti", "oqyapti", "ta'mir", "sindi"]
-    if message.text and any(word in message.text.lower() for word in repair_keywords):
-        supabase.table("requests").insert({
-            "telegram_id": message.from_user.id,
-            "description": message.text,
-            "status": "new"
-        }).execute()
 
+@dp.message(F.text)
+async def ai_response(message: types.Message):
+    resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
+    lang = get_lang(resident)
     await message.answer(TEXTS[lang]["thinking"])
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": message.text}
-            ],
-            max_tokens=500
-        )
-        await message.answer(response.choices[0].message.content, reply_markup=main_menu(lang))
+        await process_text(message, message.text, lang)
     except Exception as e:
         await message.answer(f"Ошибка: {str(e)}", reply_markup=main_menu(lang))
 
