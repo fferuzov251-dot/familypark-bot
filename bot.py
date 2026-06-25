@@ -212,6 +212,7 @@ async def voice_message(message: types.Message):
             transcription = groq_client.audio.transcriptions.create(
                 file=(file_path, audio.read()),
                 model="whisper-large-v3",
+                language=lang,
             )
         text = transcription.text.strip()
         os.remove(file_path)
