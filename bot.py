@@ -22,10 +22,19 @@ dp = Dispatcher(storage=MemoryStorage())
 groq_client = Groq(api_key=GROQ_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ==== СОСТОЯНИЯ РЕГИСТРАЦИИ ====
+# ==== СОСТОЯНИЯ ====
 class Registration(StatesGroup):
     waiting_apartment = State()
     waiting_phone = State()
+
+class Repair(StatesGroup):
+    waiting_description = State()
+
+# ==== СТАТУСЫ ЗАЯВОК (для показа жителю) ====
+STATUS_TEXT = {
+    "ru": {"new": "🆕 Новая", "in_progress": "🔧 В работе", "done": "✅ Выполнено"},
+    "uz": {"new": "🆕 Yangi", "in_progress": "🔧 Jarayonda", "done": "✅ Bajarildi"},
+}
 
 # ==== ТЕКСТЫ НА ДВУХ ЯЗЫКАХ ====
 TEXTS = {
@@ -38,7 +47,9 @@ TEXTS = {
         "btn_lang": "🌐 Til / Язык",
         "welcome": "👋 Добро пожаловать в Family Park!\n\nЗдравствуйте, {name}!\nЯ ваш персональный ИИ-помощник. Задайте любой вопрос или выберите пункт меню.",
         "balance": "💰 Ваш текущий баланс: {balance:,} сум\n📅 Следующий платёж: 1 июля 2026",
-        "repair": "🔧 Опишите вашу проблему подробно, и я передам заявку в service-отдел.",
+        "repair_ask": "🔧 Опишите вашу проблему одним сообщением (что и где сломалось).\n\nДля отмены напишите: отмена",
+        "repair_done": "✅ Заявка №{id} принята!\n🏠 Квартира: {apt}\n📝 {desc}\n\nМы свяжемся с вами в ближайшее время.",
+        "repair_cancel": "❌ Заявка отменена.",
         "no_requests": "📋 У вас пока нет заявок.",
         "requests_title": "📋 Ваши заявки:\n\n",
         "operator": "📞 Соединяю вас с оператором...\nВремя ожидания: ~5 минут\n\nИли позвоните: +998 71 000-00-00",
@@ -64,7 +75,9 @@ TEXTS = {
         "btn_lang": "🌐 Til / Язык",
         "welcome": "👋 Family Park'ga xush kelibsiz!\n\nSalom, {name}!\nMen sizning shaxsiy AI-yordamchingizman. Istalgan savol bering yoki menyudan tanlang.",
         "balance": "💰 Sizning joriy balansingiz: {balance:,} so'm\n📅 Keyingi to'lov: 2026-yil 1-iyul",
-        "repair": "🔧 Muammoyingizni batafsil yozing, men arizani service-bo'limga yuboraman.",
+        "repair_ask": "🔧 Muammoyingizni bitta xabarda yozing (nima va qayerda buzilgan).\n\nBekor qilish uchun yozing: bekor",
+        "repair_done": "✅ Ariza №{id} qabul qilindi!\n🏠 Kvartira: {apt}\n📝 {desc}\n\nTez orada siz bilan bog'lanamiz.",
+        "repair_cancel": "❌ Ariza bekor qilindi.",
         "no_requests": "📋 Sizda hozircha arizalar yo'q.",
         "requests_title": "📋 Sizning arizalaringiz:\n\n",
         "operator": "📞 Sizni operator bilan bog'layapman...\nKutish vaqti: ~5 daqiqa\n\nYoki qo'ng'iroq qiling: +998 71 000-00-00",
@@ -134,16 +147,7 @@ def match_button(text, key):
     return text in (TEXTS["ru"][key], TEXTS["uz"][key])
 
 
-async def process_text(message, text, lang):
-    repair_keywords = ["сломал", "течет", "не работает", "ремонт", "сломан", "протекает",
-                       "buzildi", "ishlamayapti", "oqyapti", "ta'mir", "sindi"]
-    if any(word in text.lower() for word in repair_keywords):
-        supabase.table("requests").insert({
-            "telegram_id": message.from_user.id,
-            "description": text,
-            "status": "new"
-        }).execute()
-
+async def ai_reply(message, text, lang):
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
@@ -183,18 +187,15 @@ async def reg_apartment(message: types.Message, state: FSMContext):
     lang = get_lang(resident)
     apt = (message.text or "").strip()
 
-    # Отмена
     if apt.lower() in ("отмена", "bekor", "/cancel"):
         await state.clear()
         await message.answer(TEXTS[lang]["reg_cancel"], reply_markup=main_menu(lang))
         return
 
-    # Проверка: только цифры
     if not apt.isdigit():
         await message.answer(TEXTS[lang]["apt_invalid"])
         return
 
-    # Проверка: не занята ли квартира другим пользователем
     existing = supabase.table("residents").select("telegram_id").eq("apartment_number", apt).execute()
     for row in existing.data:
         if row["telegram_id"] != message.from_user.id:
@@ -202,7 +203,6 @@ async def reg_apartment(message: types.Message, state: FSMContext):
             await message.answer(TEXTS[lang]["apt_taken"], reply_markup=main_menu(lang))
             return
 
-    # Запоминаем квартиру и переходим к телефону
     await state.update_data(apartment=apt)
     await state.set_state(Registration.waiting_phone)
     await message.answer(TEXTS[lang]["ask_phone"])
@@ -231,6 +231,34 @@ async def reg_phone(message: types.Message, state: FSMContext):
     await message.answer(TEXTS[lang]["reg_done"].format(apt=apt), reply_markup=main_menu(lang))
 
 
+# ==== ЗАЯВКА НА РЕМОНТ (FSM) ====
+@dp.message(Repair.waiting_description)
+async def repair_description(message: types.Message, state: FSMContext):
+    resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
+    lang = get_lang(resident)
+    desc = (message.text or "").strip()
+
+    if desc.lower() in ("отмена", "bekor", "/cancel"):
+        await state.clear()
+        await message.answer(TEXTS[lang]["repair_cancel"], reply_markup=main_menu(lang))
+        return
+
+    apt = resident.get("apartment_number")
+    inserted = supabase.table("requests").insert({
+        "telegram_id": message.from_user.id,
+        "description": desc,
+        "status": "new",
+        "apartment_number": apt
+    }).execute()
+
+    req_id = inserted.data[0]["id"]
+    await state.clear()
+    await message.answer(
+        TEXTS[lang]["repair_done"].format(id=req_id, apt=apt, desc=desc),
+        reply_markup=main_menu(lang)
+    )
+
+
 @dp.message(lambda m: m.text and match_button(m.text, "btn_lang"))
 async def change_language(message: types.Message):
     resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
@@ -250,10 +278,15 @@ async def balance(message: types.Message, state: FSMContext):
 
 
 @dp.message(lambda m: m.text and match_button(m.text, "btn_repair"))
-async def repair(message: types.Message):
+async def repair(message: types.Message, state: FSMContext):
     resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
     lang = get_lang(resident)
-    await message.answer(TEXTS[lang]["repair"])
+    if not is_registered(resident):
+        await state.set_state(Registration.waiting_apartment)
+        await message.answer(TEXTS[lang]["need_reg"])
+        return
+    await state.set_state(Repair.waiting_description)
+    await message.answer(TEXTS[lang]["repair_ask"])
 
 
 @dp.message(lambda m: m.text and match_button(m.text, "btn_requests"))
@@ -264,13 +297,14 @@ async def my_requests(message: types.Message, state: FSMContext):
         await state.set_state(Registration.waiting_apartment)
         await message.answer(TEXTS[lang]["need_reg"])
         return
-    result = supabase.table("requests").select("*").eq("telegram_id", message.from_user.id).execute()
+    result = supabase.table("requests").select("*").eq("telegram_id", message.from_user.id).order("id").execute()
     if not result.data:
         await message.answer(TEXTS[lang]["no_requests"])
         return
     text = TEXTS[lang]["requests_title"]
     for r in result.data:
-        text += f"• {r['description']} — {r['status']}\n"
+        status = STATUS_TEXT[lang].get(r["status"], r["status"])
+        text += f"#{r['id']} — {r['description']}\n{status}\n\n"
     await message.answer(text)
 
 
@@ -312,7 +346,7 @@ async def voice_message(message: types.Message):
             return
 
         await message.answer(TEXTS[lang]["voice_heard"].format(text=text))
-        await process_text(message, text, lang)
+        await ai_reply(message, text, lang)
     except Exception as e:
         await message.answer(f"Ошибка: {str(e)}", reply_markup=main_menu(lang))
 
@@ -323,13 +357,13 @@ async def ai_response(message: types.Message):
     lang = get_lang(resident)
     await message.answer(TEXTS[lang]["thinking"])
     try:
-        await process_text(message, message.text, lang)
+        await ai_reply(message, message.text, lang)
     except Exception as e:
         await message.answer(f"Ошибка: {str(e)}", reply_markup=main_menu(lang))
 
 
 async def main():
-    print("✅ Бот с ИИ, базой, 2 языками, голосом и регистрацией запущен!")
+    print("✅ Бот: ИИ, база, 2 языка, голос, регистрация, заявки запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
