@@ -4,6 +4,9 @@ from groq import Groq
 from supabase import create_client
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 
@@ -15,9 +18,14 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 groq_client = Groq(api_key=GROQ_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ==== СОСТОЯНИЯ РЕГИСТРАЦИИ ====
+class Registration(StatesGroup):
+    waiting_apartment = State()
+    waiting_phone = State()
 
 # ==== ТЕКСТЫ НА ДВУХ ЯЗЫКАХ ====
 TEXTS = {
@@ -39,6 +47,13 @@ TEXTS = {
         "choose_lang": "Выберите язык / Tilni tanlang:",
         "lang_set": "✅ Язык изменён на русский.",
         "voice_heard": "🎤 Вы сказали: {text}",
+        "ask_apartment": "📝 Регистрация. Введите номер вашей квартиры (только цифры).\n\nДля отмены напишите: отмена",
+        "ask_phone": "📱 Введите ваш номер телефона (например +998 90 123-45-67):",
+        "reg_done": "✅ Регистрация завершена! Квартира {apt}. Теперь вам доступны баланс и заявки.",
+        "apt_taken": "⚠️ Эта квартира уже зарегистрирована другим пользователем. Если это ошибка — обратитесь к оператору.",
+        "apt_invalid": "⚠️ Введите корректный номер квартиры (только цифры).",
+        "need_reg": "🔒 Для этого нужна регистрация.\n\n📝 Введите номер вашей квартиры (только цифры).\nДля отмены напишите: отмена",
+        "reg_cancel": "❌ Регистрация отменена.",
     },
     "uz": {
         "btn_balance": "💰 Mening balansim",
@@ -58,6 +73,13 @@ TEXTS = {
         "choose_lang": "Tilni tanlang / Выберите язык:",
         "lang_set": "✅ Til o'zbekchaga o'zgartirildi.",
         "voice_heard": "🎤 Siz aytdingiz: {text}",
+        "ask_apartment": "📝 Ro'yxatdan o'tish. Kvartirangiz raqamini kiriting (faqat raqam).\n\nBekor qilish uchun yozing: bekor",
+        "ask_phone": "📱 Telefon raqamingizni kiriting (masalan +998 90 123-45-67):",
+        "reg_done": "✅ Ro'yxatdan o'tish yakunlandi! Kvartira {apt}. Endi sizga balans va arizalar mavjud.",
+        "apt_taken": "⚠️ Bu kvartira boshqa foydalanuvchi tomonidan ro'yxatdan o'tkazilgan. Agar bu xato bo'lsa — operatorga murojaat qiling.",
+        "apt_invalid": "⚠️ To'g'ri kvartira raqamini kiriting (faqat raqam).",
+        "need_reg": "🔒 Buning uchun ro'yxatdan o'tish kerak.\n\n📝 Kvartirangiz raqamini kiriting (faqat raqam).\nBekor qilish uchun yozing: bekor",
+        "reg_cancel": "❌ Ro'yxatdan o'tish bekor qilindi.",
     },
 }
 
@@ -83,6 +105,10 @@ def get_or_create_resident(telegram_id: int, full_name: str):
 
 def get_lang(resident):
     return resident.get("language") or "ru"
+
+
+def is_registered(resident):
+    return bool(resident.get("apartment_number"))
 
 
 def main_menu(lang):
@@ -130,7 +156,8 @@ async def process_text(message, text, lang):
 
 
 @dp.message(Command("start"))
-async def start(message: types.Message):
+async def start(message: types.Message, state: FSMContext):
+    await state.clear()
     resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
     lang = get_lang(resident)
     t = TEXTS[lang]
@@ -149,6 +176,61 @@ async def set_language(callback: types.CallbackQuery):
     await callback.answer()
 
 
+# ==== РЕГИСТРАЦИЯ (FSM) ====
+@dp.message(Registration.waiting_apartment)
+async def reg_apartment(message: types.Message, state: FSMContext):
+    resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
+    lang = get_lang(resident)
+    apt = (message.text or "").strip()
+
+    # Отмена
+    if apt.lower() in ("отмена", "bekor", "/cancel"):
+        await state.clear()
+        await message.answer(TEXTS[lang]["reg_cancel"], reply_markup=main_menu(lang))
+        return
+
+    # Проверка: только цифры
+    if not apt.isdigit():
+        await message.answer(TEXTS[lang]["apt_invalid"])
+        return
+
+    # Проверка: не занята ли квартира другим пользователем
+    existing = supabase.table("residents").select("telegram_id").eq("apartment_number", apt).execute()
+    for row in existing.data:
+        if row["telegram_id"] != message.from_user.id:
+            await state.clear()
+            await message.answer(TEXTS[lang]["apt_taken"], reply_markup=main_menu(lang))
+            return
+
+    # Запоминаем квартиру и переходим к телефону
+    await state.update_data(apartment=apt)
+    await state.set_state(Registration.waiting_phone)
+    await message.answer(TEXTS[lang]["ask_phone"])
+
+
+@dp.message(Registration.waiting_phone)
+async def reg_phone(message: types.Message, state: FSMContext):
+    resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
+    lang = get_lang(resident)
+    phone = (message.text or "").strip()
+
+    if phone.lower() in ("отмена", "bekor", "/cancel"):
+        await state.clear()
+        await message.answer(TEXTS[lang]["reg_cancel"], reply_markup=main_menu(lang))
+        return
+
+    data = await state.get_data()
+    apt = data.get("apartment")
+
+    supabase.table("residents").update({
+        "apartment_number": apt,
+        "phone": phone
+    }).eq("telegram_id", message.from_user.id).execute()
+
+    await state.clear()
+    await message.answer(TEXTS[lang]["reg_done"].format(apt=apt), reply_markup=main_menu(lang))
+
+
 @dp.message(lambda m: m.text and match_button(m.text, "btn_lang"))
 async def change_language(message: types.Message):
     resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
@@ -157,9 +239,13 @@ async def change_language(message: types.Message):
 
 
 @dp.message(lambda m: m.text and match_button(m.text, "btn_balance"))
-async def balance(message: types.Message):
+async def balance(message: types.Message, state: FSMContext):
     resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
     lang = get_lang(resident)
+    if not is_registered(resident):
+        await state.set_state(Registration.waiting_apartment)
+        await message.answer(TEXTS[lang]["need_reg"])
+        return
     await message.answer(TEXTS[lang]["balance"].format(balance=resident['balance']))
 
 
@@ -171,9 +257,13 @@ async def repair(message: types.Message):
 
 
 @dp.message(lambda m: m.text and match_button(m.text, "btn_requests"))
-async def my_requests(message: types.Message):
+async def my_requests(message: types.Message, state: FSMContext):
     resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
     lang = get_lang(resident)
+    if not is_registered(resident):
+        await state.set_state(Registration.waiting_apartment)
+        await message.answer(TEXTS[lang]["need_reg"])
+        return
     result = supabase.table("requests").select("*").eq("telegram_id", message.from_user.id).execute()
     if not result.data:
         await message.answer(TEXTS[lang]["no_requests"])
@@ -239,7 +329,7 @@ async def ai_response(message: types.Message):
 
 
 async def main():
-    print("✅ Бот с ИИ, базой данных и поддержкой 2 языков запущен!")
+    print("✅ Бот с ИИ, базой, 2 языками, голосом и регистрацией запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
