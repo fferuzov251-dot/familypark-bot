@@ -22,6 +22,13 @@ dp = Dispatcher(storage=MemoryStorage())
 groq_client = Groq(api_key=GROQ_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# ==== СПИСОК АДМИНОВ (telegram_id сотрудников ЖК) ====
+# Чтобы добавить сотрудника — впиши его id через запятую: [1361035231, 123456789]
+ADMINS = [1361035231]
+
+def is_admin(telegram_id: int) -> bool:
+    return telegram_id in ADMINS
+
 # ==== СОСТОЯНИЯ ====
 class Registration(StatesGroup):
     waiting_apartment = State()
@@ -65,6 +72,8 @@ TEXTS = {
         "apt_invalid": "⚠️ Введите корректный номер квартиры (только цифры).",
         "need_reg": "🔒 Для этого нужна регистрация.\n\n📝 Введите номер вашей квартиры (только цифры).\nДля отмены напишите: отмена",
         "reg_cancel": "❌ Регистрация отменена.",
+        # уведомление жителю при смене статуса
+        "status_changed": "🔔 Статус вашей заявки №{id} изменён:\n{status}",
     },
     "uz": {
         "btn_balance": "💰 Mening balansim",
@@ -93,6 +102,7 @@ TEXTS = {
         "apt_invalid": "⚠️ To'g'ri kvartira raqamini kiriting (faqat raqam).",
         "need_reg": "🔒 Buning uchun ro'yxatdan o'tish kerak.\n\n📝 Kvartirangiz raqamini kiriting (faqat raqam).\nBekor qilish uchun yozing: bekor",
         "reg_cancel": "❌ Ro'yxatdan o'tish bekor qilindi.",
+        "status_changed": "🔔 Sizning №{id} arizangiz holati o'zgardi:\n{status}",
     },
 }
 
@@ -147,6 +157,14 @@ def match_button(text, key):
     return text in (TEXTS["ru"][key], TEXTS["uz"][key])
 
 
+# ==== КЛАВИАТУРА АДМИНА ДЛЯ ОДНОЙ ЗАЯВКИ ====
+def admin_request_keyboard(req_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔧 В работе", callback_data=f"adm_progress_{req_id}"),
+         InlineKeyboardButton(text="✅ Выполнено", callback_data=f"adm_done_{req_id}")]
+    ])
+
+
 async def ai_reply(message, text, lang):
     response = groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -169,6 +187,76 @@ async def start(message: types.Message, state: FSMContext):
         t["welcome"].format(name=message.from_user.first_name),
         reply_markup=main_menu(lang)
     )
+
+
+# ==== АДМИН-ПАНЕЛЬ ====
+@dp.message(Command("admin"))
+async def admin_panel(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return  # не админ — молча игнорируем, обычный житель команду не видит
+    await state.clear()
+
+    # Берём все новые заявки
+    result = supabase.table("requests").select("*").eq("status", "new").order("id").execute()
+    if not result.data:
+        await message.answer("📋 Новых заявок нет.")
+        return
+
+    await message.answer(f"🛠 Админ-панель\n\nНовых заявок: {len(result.data)}")
+
+    for r in result.data:
+        # Подтягиваем телефон жителя
+        res = supabase.table("residents").select("phone, full_name").eq("telegram_id", r["telegram_id"]).execute()
+        phone = res.data[0]["phone"] if res.data else "—"
+        name = res.data[0]["full_name"] if res.data else "—"
+
+        text = (
+            f"📨 Заявка №{r['id']}\n"
+            f"🏠 Квартира: {r.get('apartment_number') or '—'}\n"
+            f"👤 {name}\n"
+            f"📞 {phone or '—'}\n"
+            f"📝 {r['description']}"
+        )
+        await message.answer(text, reply_markup=admin_request_keyboard(r["id"]))
+
+
+@dp.callback_query(lambda c: c.data.startswith("adm_"))
+async def admin_change_status(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    # callback_data вида adm_progress_5 или adm_done_5
+    parts = callback.data.split("_")
+    action = parts[1]          # progress / done
+    req_id = int(parts[2])
+
+    new_status = "in_progress" if action == "progress" else "done"
+
+    # Обновляем статус в базе
+    supabase.table("requests").update({"status": new_status}).eq("id", req_id).execute()
+
+    # Узнаём, кому принадлежит заявка, чтобы уведомить жителя
+    req = supabase.table("requests").select("telegram_id").eq("id", req_id).execute()
+    if req.data:
+        resident_tg = req.data[0]["telegram_id"]
+        res = supabase.table("residents").select("language").eq("telegram_id", resident_tg).execute()
+        res_lang = res.data[0]["language"] if res.data else "ru"
+        status_label = STATUS_TEXT[res_lang].get(new_status, new_status)
+        try:
+            await bot.send_message(
+                resident_tg,
+                TEXTS[res_lang]["status_changed"].format(id=req_id, status=status_label)
+            )
+        except Exception:
+            pass  # если житель заблокировал бота — просто не падаем
+
+    # Обновляем сообщение у админа
+    admin_label = STATUS_TEXT["ru"].get(new_status, new_status)
+    await callback.message.edit_text(
+        callback.message.text + f"\n\n➡️ Статус изменён: {admin_label}"
+    )
+    await callback.answer("Готово ✅")
 
 
 @dp.callback_query(lambda c: c.data in ("lang_ru", "lang_uz"))
@@ -257,6 +345,16 @@ async def repair_description(message: types.Message, state: FSMContext):
         TEXTS[lang]["repair_done"].format(id=req_id, apt=apt, desc=desc),
         reply_markup=main_menu(lang)
     )
+
+    # Уведомляем админов о новой заявке
+    for admin_id in ADMINS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🆕 Новая заявка №{req_id}\n🏠 Квартира: {apt}\n📝 {desc}\n\nОткройте /admin для обработки."
+            )
+        except Exception:
+            pass
 
 
 @dp.message(lambda m: m.text and match_button(m.text, "btn_lang"))
@@ -363,7 +461,7 @@ async def ai_response(message: types.Message):
 
 
 async def main():
-    print("✅ Бот: ИИ, база, 2 языка, голос, регистрация, заявки запущен!")
+    print("✅ Бот: ИИ, база, 2 языка, голос, регистрация, заявки, админ-панель запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
