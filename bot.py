@@ -29,10 +29,6 @@ ADMINS = [1361035231]
 def is_admin(telegram_id: int) -> bool:
     return telegram_id in ADMINS
 
-# ==== КНОПКИ АДМИН-МЕНЮ (текст) ====
-ADM_BTN_NEW = "🆕 Новые заявки"
-ADM_BTN_PROGRESS = "🔧 В работе"
-
 # ==== СОСТОЯНИЯ ====
 class Registration(StatesGroup):
     waiting_apartment = State()
@@ -41,11 +37,59 @@ class Registration(StatesGroup):
 class Repair(StatesGroup):
     waiting_description = State()
 
-# ==== СТАТУСЫ ЗАЯВОК (для показа жителю) ====
+# ==== СТАТУСЫ ЗАЯВОК ====
 STATUS_TEXT = {
     "ru": {"new": "🆕 Новая", "in_progress": "🔧 В работе", "done": "✅ Выполнено"},
     "uz": {"new": "🆕 Yangi", "in_progress": "🔧 Jarayonda", "done": "✅ Bajarildi"},
 }
+
+# ==== АДМИН-КНОПКИ НА ДВУХ ЯЗЫКАХ ====
+ADM_TEXTS = {
+    "ru": {
+        "btn_new": "🆕 Новые заявки",
+        "btn_progress": "🔧 В работе",
+        "btn_normal": "🏠 Обычное меню",
+        "btn_back": "🛠 Админ-меню",
+        "welcome_admin": "🛠 Вы вошли как сотрудник. Доступно админ-меню ниже.",
+        "panel": "🛠 Админ-панель. Выберите раздел:",
+        "back": "🛠 Админ-меню:",
+        "normal": "🏠 Обычное меню. Для возврата нажмите «🛠 Админ-меню».",
+        "list_new": "🛠 Заявки (новые): {n}",
+        "list_progress": "🛠 Заявки (в работе): {n}",
+        "empty_new": "📋 Новых заявок нет.",
+        "empty_progress": "📋 Заявок в работе нет.",
+        "card": "📨 Заявка №{id}\n🏠 Квартира: {apt}\n👤 {name}\n📞 {phone}\n📝 {desc}",
+        "status_changed_admin": "\n\n➡️ Статус: {status}",
+        "new_request_notify": "🆕 Новая заявка №{id}\n🏠 Квартира: {apt}\n📝 {desc}\n\nНажмите «🆕 Новые заявки» для обработки.",
+        "no_access": "Нет доступа",
+        "done": "Готово ✅",
+    },
+    "uz": {
+        "btn_new": "🆕 Yangi arizalar",
+        "btn_progress": "🔧 Jarayonda",
+        "btn_normal": "🏠 Oddiy menyu",
+        "btn_back": "🛠 Admin-menyu",
+        "welcome_admin": "🛠 Siz xodim sifatida kirdingiz. Quyida admin-menyu mavjud.",
+        "panel": "🛠 Admin-panel. Bo'limni tanlang:",
+        "back": "🛠 Admin-menyu:",
+        "normal": "🏠 Oddiy menyu. Qaytish uchun «🛠 Admin-menyu» tugmasini bosing.",
+        "list_new": "🛠 Arizalar (yangi): {n}",
+        "list_progress": "🛠 Arizalar (jarayonda): {n}",
+        "empty_new": "📋 Yangi arizalar yo'q.",
+        "empty_progress": "📋 Jarayondagi arizalar yo'q.",
+        "card": "📨 Ariza №{id}\n🏠 Kvartira: {apt}\n👤 {name}\n📞 {phone}\n📝 {desc}",
+        "status_changed_admin": "\n\n➡️ Holat: {status}",
+        "new_request_notify": "🆕 Yangi ariza №{id}\n🏠 Kvartira: {apt}\n📝 {desc}\n\nQayta ishlash uchun «🆕 Yangi arizalar» tugmasini bosing.",
+        "no_access": "Ruxsat yo'q",
+        "done": "Tayyor ✅",
+    },
+}
+
+# Множества текстов кнопок (для распознавания нажатий на любом языке)
+ADM_BTN_NEW_ALL = {ADM_TEXTS["ru"]["btn_new"], ADM_TEXTS["uz"]["btn_new"]}
+ADM_BTN_PROGRESS_ALL = {ADM_TEXTS["ru"]["btn_progress"], ADM_TEXTS["uz"]["btn_progress"]}
+ADM_BTN_NORMAL_ALL = {ADM_TEXTS["ru"]["btn_normal"], ADM_TEXTS["uz"]["btn_normal"]}
+ADM_BTN_BACK_ALL = {ADM_TEXTS["ru"]["btn_back"], ADM_TEXTS["uz"]["btn_back"]}
 
 # ==== ТЕКСТЫ НА ДВУХ ЯЗЫКАХ ====
 TEXTS = {
@@ -76,7 +120,6 @@ TEXTS = {
         "apt_invalid": "⚠️ Введите корректный номер квартиры (только цифры).",
         "need_reg": "🔒 Для этого нужна регистрация.\n\n📝 Введите номер вашей квартиры (только цифры).\nДля отмены напишите: отмена",
         "reg_cancel": "❌ Регистрация отменена.",
-        # уведомление жителю при смене статуса
         "status_changed": "🔔 Статус вашей заявки №{id} изменён:\n{status}",
     },
     "uz": {
@@ -134,26 +177,35 @@ def get_lang(resident):
     return resident.get("language") or "ru"
 
 
+def get_lang_by_id(telegram_id: int) -> str:
+    res = supabase.table("residents").select("language").eq("telegram_id", telegram_id).execute()
+    if res.data and res.data[0].get("language"):
+        return res.data[0]["language"]
+    return "ru"
+
+
 def is_registered(resident):
     return bool(resident.get("apartment_number"))
 
 
-def main_menu(lang):
+def main_menu(lang, for_admin=False):
     t = TEXTS[lang]
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=t["btn_balance"]), KeyboardButton(text=t["btn_repair"])],
-            [KeyboardButton(text=t["btn_requests"]), KeyboardButton(text=t["btn_operator"])],
-            [KeyboardButton(text=t["btn_info"]), KeyboardButton(text=t["btn_lang"])],
-        ],
-        resize_keyboard=True
-    )
+    keyboard = [
+        [KeyboardButton(text=t["btn_balance"]), KeyboardButton(text=t["btn_repair"])],
+        [KeyboardButton(text=t["btn_requests"]), KeyboardButton(text=t["btn_operator"])],
+        [KeyboardButton(text=t["btn_info"]), KeyboardButton(text=t["btn_lang"])],
+    ]
+    if for_admin:
+        keyboard.append([KeyboardButton(text=ADM_TEXTS[lang]["btn_back"])])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
-def admin_menu():
+def admin_menu(lang):
+    a = ADM_TEXTS[lang]
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=ADM_BTN_NEW), KeyboardButton(text=ADM_BTN_PROGRESS)],
+            [KeyboardButton(text=a["btn_new"]), KeyboardButton(text=a["btn_progress"])],
+            [KeyboardButton(text=a["btn_normal"])],
         ],
         resize_keyboard=True
     )
@@ -170,8 +222,11 @@ def match_button(text, key):
     return text in (TEXTS["ru"][key], TEXTS["uz"][key])
 
 
+def menu_for(user_id, lang):
+    return main_menu(lang, for_admin=is_admin(user_id))
+
+
 # ==== КЛАВИАТУРА АДМИНА ДЛЯ ОДНОЙ ЗАЯВКИ ====
-# new: обе кнопки; in_progress: только "Выполнено"
 def admin_request_keyboard(req_id, status):
     if status == "new":
         rows = [[
@@ -188,26 +243,28 @@ def admin_request_keyboard(req_id, status):
 
 
 # ==== ПОКАЗ СПИСКА ЗАЯВОК АДМИНУ (по статусу) ====
-async def show_admin_requests(message, status):
+async def show_admin_requests(message, status, lang):
+    a = ADM_TEXTS[lang]
     result = supabase.table("requests").select("*").eq("status", status).order("id").execute()
-    status_name = "новых" if status == "new" else "в работе"
     if not result.data:
-        await message.answer(f"📋 Заявок ({status_name}) нет.", reply_markup=admin_menu())
+        empty = a["empty_new"] if status == "new" else a["empty_progress"]
+        await message.answer(empty, reply_markup=admin_menu(lang))
         return
 
-    await message.answer(f"🛠 Заявки ({status_name}): {len(result.data)}", reply_markup=admin_menu())
+    title = a["list_new"] if status == "new" else a["list_progress"]
+    await message.answer(title.format(n=len(result.data)), reply_markup=admin_menu(lang))
 
     for r in result.data:
         res = supabase.table("residents").select("phone, full_name").eq("telegram_id", r["telegram_id"]).execute()
         phone = res.data[0]["phone"] if res.data else "—"
         name = res.data[0]["full_name"] if res.data else "—"
 
-        text = (
-            f"📨 Заявка №{r['id']}\n"
-            f"🏠 Квартира: {r.get('apartment_number') or '—'}\n"
-            f"👤 {name}\n"
-            f"📞 {phone or '—'}\n"
-            f"📝 {r['description']}"
+        text = a["card"].format(
+            id=r["id"],
+            apt=r.get("apartment_number") or "—",
+            name=name or "—",
+            phone=phone or "—",
+            desc=r["description"]
         )
         await message.answer(text, reply_markup=admin_request_keyboard(r["id"], r["status"]))
 
@@ -221,7 +278,7 @@ async def ai_reply(message, text, lang):
         ],
         max_tokens=500
     )
-    await message.answer(response.choices[0].message.content, reply_markup=main_menu(lang))
+    await message.answer(response.choices[0].message.content, reply_markup=menu_for(message.from_user.id, lang))
 
 
 @dp.message(Command("start"))
@@ -230,13 +287,8 @@ async def start(message: types.Message, state: FSMContext):
     resident = get_or_create_resident(message.from_user.id, message.from_user.full_name)
     lang = get_lang(resident)
     t = TEXTS[lang]
-    # Если админ — показываем админское меню
     if is_admin(message.from_user.id):
-        await message.answer(
-            t["welcome"].format(name=message.from_user.first_name),
-            reply_markup=main_menu(lang)
-        )
-        await message.answer("🛠 Вы вошли как сотрудник. Доступно админ-меню ниже.", reply_markup=admin_menu())
+        await message.answer(ADM_TEXTS[lang]["welcome_admin"], reply_markup=admin_menu(lang))
         return
     await message.answer(
         t["welcome"].format(name=message.from_user.first_name),
@@ -248,51 +300,67 @@ async def start(message: types.Message, state: FSMContext):
 @dp.message(Command("admin"))
 async def admin_panel(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
-        return  # не админ — молча игнорируем
+        return
     await state.clear()
-    await message.answer("🛠 Админ-панель. Выберите раздел:", reply_markup=admin_menu())
+    lang = get_lang_by_id(message.from_user.id)
+    await message.answer(ADM_TEXTS[lang]["panel"], reply_markup=admin_menu(lang))
 
 
-# Кнопка "Новые заявки"
-@dp.message(lambda m: m.text == ADM_BTN_NEW)
+@dp.message(lambda m: m.text in ADM_BTN_NEW_ALL)
 async def admin_new(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await state.clear()
-    await show_admin_requests(message, "new")
+    lang = get_lang_by_id(message.from_user.id)
+    await show_admin_requests(message, "new", lang)
 
 
-# Кнопка "В работе"
-@dp.message(lambda m: m.text == ADM_BTN_PROGRESS)
+@dp.message(lambda m: m.text in ADM_BTN_PROGRESS_ALL)
 async def admin_progress(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await state.clear()
-    await show_admin_requests(message, "in_progress")
+    lang = get_lang_by_id(message.from_user.id)
+    await show_admin_requests(message, "in_progress", lang)
+
+
+@dp.message(lambda m: m.text in ADM_BTN_NORMAL_ALL)
+async def admin_to_normal(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    lang = get_lang_by_id(message.from_user.id)
+    await message.answer(ADM_TEXTS[lang]["normal"], reply_markup=main_menu(lang, for_admin=True))
+
+
+@dp.message(lambda m: m.text in ADM_BTN_BACK_ALL)
+async def admin_back(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    lang = get_lang_by_id(message.from_user.id)
+    await message.answer(ADM_TEXTS[lang]["back"], reply_markup=admin_menu(lang))
 
 
 @dp.callback_query(lambda c: c.data.startswith("adm_"))
 async def admin_change_status(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Нет доступа", show_alert=True)
+        admin_lang = get_lang_by_id(callback.from_user.id)
+        await callback.answer(ADM_TEXTS[admin_lang]["no_access"], show_alert=True)
         return
 
-    # callback_data вида adm_progress_5 или adm_done_5
     parts = callback.data.split("_")
-    action = parts[1]          # progress / done
+    action = parts[1]
     req_id = int(parts[2])
-
     new_status = "in_progress" if action == "progress" else "done"
 
-    # Обновляем статус в базе
     supabase.table("requests").update({"status": new_status}).eq("id", req_id).execute()
 
-    # Узнаём, кому принадлежит заявка, чтобы уведомить жителя
+    # Уведомляем жителя на ЕГО языке
     req = supabase.table("requests").select("telegram_id").eq("id", req_id).execute()
     if req.data:
         resident_tg = req.data[0]["telegram_id"]
-        res = supabase.table("residents").select("language").eq("telegram_id", resident_tg).execute()
-        res_lang = res.data[0]["language"] if res.data else "ru"
+        res_lang = get_lang_by_id(resident_tg)
         status_label = STATUS_TEXT[res_lang].get(new_status, new_status)
         try:
             await bot.send_message(
@@ -300,15 +368,16 @@ async def admin_change_status(callback: types.CallbackQuery):
                 TEXTS[res_lang]["status_changed"].format(id=req_id, status=status_label)
             )
         except Exception:
-            pass  # если житель заблокировал бота — просто не падаем
+            pass
 
-    # Обновляем сообщение у админа: меняем текст и кнопки под новый статус
-    admin_label = STATUS_TEXT["ru"].get(new_status, new_status)
+    # Обновляем сообщение у админа на ЕГО языке
+    admin_lang = get_lang_by_id(callback.from_user.id)
+    admin_label = STATUS_TEXT[admin_lang].get(new_status, new_status)
     await callback.message.edit_text(
-        callback.message.text + f"\n\n➡️ Статус: {admin_label}",
+        callback.message.text + ADM_TEXTS[admin_lang]["status_changed_admin"].format(status=admin_label),
         reply_markup=admin_request_keyboard(req_id, new_status)
     )
-    await callback.answer("Готово ✅")
+    await callback.answer(ADM_TEXTS[admin_lang]["done"])
 
 
 @dp.callback_query(lambda c: c.data in ("lang_ru", "lang_uz"))
@@ -316,7 +385,8 @@ async def set_language(callback: types.CallbackQuery):
     new_lang = "ru" if callback.data == "lang_ru" else "uz"
     supabase.table("residents").update({"language": new_lang}).eq("telegram_id", callback.from_user.id).execute()
     t = TEXTS[new_lang]
-    await callback.message.answer(t["lang_set"], reply_markup=main_menu(new_lang))
+    # Если это админ — возвращаем его в обычное меню с кнопкой возврата; иначе обычное меню
+    await callback.message.answer(t["lang_set"], reply_markup=menu_for(callback.from_user.id, new_lang))
     await callback.answer()
 
 
@@ -329,7 +399,7 @@ async def reg_apartment(message: types.Message, state: FSMContext):
 
     if apt.lower() in ("отмена", "bekor", "/cancel"):
         await state.clear()
-        await message.answer(TEXTS[lang]["reg_cancel"], reply_markup=main_menu(lang))
+        await message.answer(TEXTS[lang]["reg_cancel"], reply_markup=menu_for(message.from_user.id, lang))
         return
 
     if not apt.isdigit():
@@ -340,7 +410,7 @@ async def reg_apartment(message: types.Message, state: FSMContext):
     for row in existing.data:
         if row["telegram_id"] != message.from_user.id:
             await state.clear()
-            await message.answer(TEXTS[lang]["apt_taken"], reply_markup=main_menu(lang))
+            await message.answer(TEXTS[lang]["apt_taken"], reply_markup=menu_for(message.from_user.id, lang))
             return
 
     await state.update_data(apartment=apt)
@@ -356,7 +426,7 @@ async def reg_phone(message: types.Message, state: FSMContext):
 
     if phone.lower() in ("отмена", "bekor", "/cancel"):
         await state.clear()
-        await message.answer(TEXTS[lang]["reg_cancel"], reply_markup=main_menu(lang))
+        await message.answer(TEXTS[lang]["reg_cancel"], reply_markup=menu_for(message.from_user.id, lang))
         return
 
     data = await state.get_data()
@@ -368,7 +438,7 @@ async def reg_phone(message: types.Message, state: FSMContext):
     }).eq("telegram_id", message.from_user.id).execute()
 
     await state.clear()
-    await message.answer(TEXTS[lang]["reg_done"].format(apt=apt), reply_markup=main_menu(lang))
+    await message.answer(TEXTS[lang]["reg_done"].format(apt=apt), reply_markup=menu_for(message.from_user.id, lang))
 
 
 # ==== ЗАЯВКА НА РЕМОНТ (FSM) ====
@@ -380,7 +450,7 @@ async def repair_description(message: types.Message, state: FSMContext):
 
     if desc.lower() in ("отмена", "bekor", "/cancel"):
         await state.clear()
-        await message.answer(TEXTS[lang]["repair_cancel"], reply_markup=main_menu(lang))
+        await message.answer(TEXTS[lang]["repair_cancel"], reply_markup=menu_for(message.from_user.id, lang))
         return
 
     apt = resident.get("apartment_number")
@@ -395,15 +465,16 @@ async def repair_description(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
         TEXTS[lang]["repair_done"].format(id=req_id, apt=apt, desc=desc),
-        reply_markup=main_menu(lang)
+        reply_markup=menu_for(message.from_user.id, lang)
     )
 
-    # Уведомляем админов о новой заявке
+    # Уведомляем админов о новой заявке (каждого на его языке)
     for admin_id in ADMINS:
         try:
+            a_lang = get_lang_by_id(admin_id)
             await bot.send_message(
                 admin_id,
-                f"🆕 Новая заявка №{req_id}\n🏠 Квартира: {apt}\n📝 {desc}\n\nНажмите «🆕 Новые заявки» для обработки."
+                ADM_TEXTS[a_lang]["new_request_notify"].format(id=req_id, apt=apt, desc=desc)
             )
         except Exception:
             pass
@@ -492,13 +563,13 @@ async def voice_message(message: types.Message):
         os.remove(file_path)
 
         if not text:
-            await message.answer("🎤 ...", reply_markup=main_menu(lang))
+            await message.answer("🎤 ...", reply_markup=menu_for(message.from_user.id, lang))
             return
 
         await message.answer(TEXTS[lang]["voice_heard"].format(text=text))
         await ai_reply(message, text, lang)
     except Exception as e:
-        await message.answer(f"Ошибка: {str(e)}", reply_markup=main_menu(lang))
+        await message.answer(f"Ошибка: {str(e)}", reply_markup=menu_for(message.from_user.id, lang))
 
 
 @dp.message(F.text)
@@ -509,11 +580,11 @@ async def ai_response(message: types.Message):
     try:
         await ai_reply(message, message.text, lang)
     except Exception as e:
-        await message.answer(f"Ошибка: {str(e)}", reply_markup=main_menu(lang))
+        await message.answer(f"Ошибка: {str(e)}", reply_markup=menu_for(message.from_user.id, lang))
 
 
 async def main():
-    print("✅ Бот: ИИ, база, 2 языка, голос, регистрация, заявки, админ-меню запущен!")
+    print("✅ Бот: ИИ, база, 2 языка (вкл. админку), голос, регистрация, заявки запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
