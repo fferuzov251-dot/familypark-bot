@@ -1,5 +1,6 @@
 import asyncio
 import os
+from datetime import datetime
 from groq import Groq
 from supabase import create_client
 from aiogram import Bot, Dispatcher, types, F
@@ -8,6 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -29,6 +31,11 @@ ADMINS = [1361035231]
 def is_admin(telegram_id: int) -> bool:
     return telegram_id in ADMINS
 
+# ==== СУММА МЕСЯЧНОГО ПЛАТЕЖА (порог должника) ====
+# Если баланс жителя меньше этой суммы — он считается должником.
+# Поменять сумму можно прямо здесь, в одной строке.
+MONTHLY_FEE = 450000
+
 # ==== СОСТОЯНИЯ ====
 class Registration(StatesGroup):
     waiting_apartment = State()
@@ -48,6 +55,7 @@ ADM_TEXTS = {
     "ru": {
         "btn_new": "🆕 Новые заявки",
         "btn_progress": "🔧 В работе",
+        "btn_remind": "📢 Отправить напоминания",
         "btn_normal": "🏠 Обычное меню",
         "btn_back": "🛠 Админ-меню",
         "welcome_admin": "🛠 Вы вошли как сотрудник. Доступно админ-меню ниже.",
@@ -63,10 +71,13 @@ ADM_TEXTS = {
         "new_request_notify": "🆕 Новая заявка №{id}\n🏠 Квартира: {apt}\n📝 {desc}\n\nНажмите «🆕 Новые заявки» для обработки.",
         "no_access": "Нет доступа",
         "done": "Готово ✅",
+        "remind_start": "📢 Рассылаю напоминания об оплате...",
+        "remind_result": "✅ Напоминания отправлены: {n} жит.\n(должников: {debt}, оплативших: {ok})",
     },
     "uz": {
         "btn_new": "🆕 Yangi arizalar",
         "btn_progress": "🔧 Jarayonda",
+        "btn_remind": "📢 Eslatma yuborish",
         "btn_normal": "🏠 Oddiy menyu",
         "btn_back": "🛠 Admin-menyu",
         "welcome_admin": "🛠 Siz xodim sifatida kirdingiz. Quyida admin-menyu mavjud.",
@@ -82,14 +93,29 @@ ADM_TEXTS = {
         "new_request_notify": "🆕 Yangi ariza №{id}\n🏠 Kvartira: {apt}\n📝 {desc}\n\nQayta ishlash uchun «🆕 Yangi arizalar» tugmasini bosing.",
         "no_access": "Ruxsat yo'q",
         "done": "Tayyor ✅",
+        "remind_start": "📢 To'lov eslatmalari yuborilmoqda...",
+        "remind_result": "✅ Eslatmalar yuborildi: {n} kishi.\n(qarzdorlar: {debt}, to'laganlar: {ok})",
     },
 }
 
 # Множества текстов кнопок (для распознавания нажатий на любом языке)
 ADM_BTN_NEW_ALL = {ADM_TEXTS["ru"]["btn_new"], ADM_TEXTS["uz"]["btn_new"]}
 ADM_BTN_PROGRESS_ALL = {ADM_TEXTS["ru"]["btn_progress"], ADM_TEXTS["uz"]["btn_progress"]}
+ADM_BTN_REMIND_ALL = {ADM_TEXTS["ru"]["btn_remind"], ADM_TEXTS["uz"]["btn_remind"]}
 ADM_BTN_NORMAL_ALL = {ADM_TEXTS["ru"]["btn_normal"], ADM_TEXTS["uz"]["btn_normal"]}
 ADM_BTN_BACK_ALL = {ADM_TEXTS["ru"]["btn_back"], ADM_TEXTS["uz"]["btn_back"]}
+
+# ==== ТЕКСТЫ НАПОМИНАНИЙ ОБ ОПЛАТЕ (на двух языках) ====
+REMINDER_TEXTS = {
+    "ru": {
+        "ok": "🔔 Напоминание об оплате\n\nЗдравствуйте! Напоминаем, что следующий платёж — до 1 числа.\nВаш баланс: {balance:,} сум.\nСпасибо, что оплачиваете вовремя! 🙏",
+        "debt": "🔔 Напоминание об оплате\n\nЗдравствуйте! На вашем счёте образовалась задолженность.\nТекущий баланс: {balance:,} сум.\nПожалуйста, пополните счёт до 1 числа, чтобы избежать неудобств. Спасибо!",
+    },
+    "uz": {
+        "ok": "🔔 To'lov haqida eslatma\n\nSalom! Keyingi to'lov — oyning 1-sanasigacha ekanini eslatamiz.\nSizning balansingiz: {balance:,} so'm.\nO'z vaqtida to'laganingiz uchun rahmat! 🙏",
+        "debt": "🔔 To'lov haqida eslatma\n\nSalom! Hisobingizda qarzdorlik paydo bo'ldi.\nJoriy balans: {balance:,} so'm.\nNoqulayliklarga yo'l qo'ymaslik uchun 1-sanagacha hisobni to'ldiring. Rahmat!",
+    },
+}
 
 # ==== ТЕКСТЫ НА ДВУХ ЯЗЫКАХ ====
 TEXTS = {
@@ -205,6 +231,7 @@ def admin_menu(lang):
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=a["btn_new"]), KeyboardButton(text=a["btn_progress"])],
+            [KeyboardButton(text=a["btn_remind"])],
             [KeyboardButton(text=a["btn_normal"])],
         ],
         resize_keyboard=True
@@ -240,6 +267,42 @@ def admin_request_keyboard(req_id, status):
     else:
         rows = []
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ==== РАССЫЛКА НАПОМИНАНИЙ ОБ ОПЛАТЕ ====
+# Возвращает (всего, должников, оплативших)
+async def send_payment_reminders():
+    # Берём только зарегистрированных (у кого есть квартира)
+    result = supabase.table("residents").select("*").execute()
+    total = 0
+    debt = 0
+    ok = 0
+    for r in result.data:
+        if not r.get("apartment_number"):
+            continue  # незарегистрированным не шлём
+        tg_id = r["telegram_id"]
+        lang = r.get("language") or "ru"
+        balance = r.get("balance") or 0
+        # Должник, если баланс меньше месячного платежа
+        if balance < MONTHLY_FEE:
+            text = REMINDER_TEXTS[lang]["debt"].format(balance=balance)
+            debt += 1
+        else:
+            text = REMINDER_TEXTS[lang]["ok"].format(balance=balance)
+            ok += 1
+        try:
+            await bot.send_message(tg_id, text)
+            total += 1
+        except Exception:
+            pass  # если житель заблокировал бота — пропускаем
+    return total, debt, ok
+
+
+# Функция для планировщика: проверяет дату и шлёт 25 числа
+async def scheduled_reminder_job():
+    # Шлём только 25 числа
+    if datetime.now().day == 25:
+        await send_payment_reminders()
 
 
 # ==== ПОКАЗ СПИСКА ЗАЯВОК АДМИНУ (по статусу) ====
@@ -324,6 +387,21 @@ async def admin_progress(message: types.Message, state: FSMContext):
     await show_admin_requests(message, "in_progress", lang)
 
 
+# Кнопка "Отправить напоминания" (ручной запуск рассылки)
+@dp.message(lambda m: m.text in ADM_BTN_REMIND_ALL)
+async def admin_remind(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    lang = get_lang_by_id(message.from_user.id)
+    await message.answer(ADM_TEXTS[lang]["remind_start"])
+    total, debt, ok = await send_payment_reminders()
+    await message.answer(
+        ADM_TEXTS[lang]["remind_result"].format(n=total, debt=debt, ok=ok),
+        reply_markup=admin_menu(lang)
+    )
+
+
 @dp.message(lambda m: m.text in ADM_BTN_NORMAL_ALL)
 async def admin_to_normal(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -385,7 +463,6 @@ async def set_language(callback: types.CallbackQuery):
     new_lang = "ru" if callback.data == "lang_ru" else "uz"
     supabase.table("residents").update({"language": new_lang}).eq("telegram_id", callback.from_user.id).execute()
     t = TEXTS[new_lang]
-    # Если это админ — возвращаем его в обычное меню с кнопкой возврата; иначе обычное меню
     await callback.message.answer(t["lang_set"], reply_markup=menu_for(callback.from_user.id, new_lang))
     await callback.answer()
 
@@ -584,7 +661,11 @@ async def ai_response(message: types.Message):
 
 
 async def main():
-    print("✅ Бот: ИИ, база, 2 языка (вкл. админку), голос, регистрация, заявки запущен!")
+    print("✅ Бот: ИИ, база, 2 языка, голос, регистрация, заявки, напоминания запущен!")
+    # Запускаем планировщик: каждый день в 10:00 проверяем, не 25-е ли число
+    scheduler = AsyncIOScheduler(timezone="Asia/Samarkand")
+    scheduler.add_job(scheduled_reminder_job, "cron", hour=10, minute=0)
+    scheduler.start()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
